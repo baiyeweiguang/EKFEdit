@@ -1,4 +1,4 @@
-### [IJCAI2026] Official implementation of the paper: "EKFEdit: Extended Kalman Filter for Training-Free Flow-Based Image Editing"
+## [IJCAI2026] EKFEdit: Extended Kalman Filter for Training-Free Flow-Based Image Editing
 
 ![](assets/fig2.png)
 

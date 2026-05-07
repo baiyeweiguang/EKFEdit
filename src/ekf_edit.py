@@ -59,11 +59,10 @@ class EditPipeline:
 
     @torch.no_grad()
     def get_embeds(self, prompt: str, guidance_scale: float, do_classifier_free_guidance: bool = True):
-        """严格对应 get_text_embeddings 的逻辑"""
         (prompt_embeds, negative_prompt_embeds, 
          pooled_prompt_embeds, negative_pooled_prompt_embeds) = self.pipe.encode_prompt(
             prompt=prompt, prompt_2=prompt, prompt_3=prompt,
-            negative_prompt="", negative_prompt_2="", negative_prompt_3="", # 显式空负面提示词
+            negative_prompt="", negative_prompt_2="", negative_prompt_3="",
             device=self.device, do_classifier_free_guidance=do_classifier_free_guidance,
             num_images_per_prompt=1
         )
