@@ -397,7 +397,7 @@ class EditPipeline:
             if len(inv_sigmas) - 1 - i == skip_steps:
                 break
 
-            t_key_val = int(t_next.item() * 1000)
+            t_key_val = int(t_next.item())
             
             zt_curr_inv = zt_inv 
             
