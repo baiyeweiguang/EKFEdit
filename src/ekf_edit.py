@@ -1,5 +1,7 @@
 import argparse
 import torch
+from torch.func import jvp
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from diffusers import StableDiffusion3Pipeline, FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
@@ -71,6 +73,36 @@ class EditPipeline:
                    torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
         return prompt_embeds, pooled_prompt_embeds
 
+    def target_velocity(self, x, timestep, prompt_embeds, pooled_embeds, guidance_scale):
+        latent_input = torch.cat([x, x]) if guidance_scale > 1.0 else x
+        t_expand = (timestep * 1000).long().expand(latent_input.shape[0]).to(self.device)
+        noise_pred = self.pipe.transformer(
+            hidden_states=latent_input,
+            timestep=t_expand,
+            encoder_hidden_states=prompt_embeds,
+            pooled_projections=pooled_embeds,
+            return_dict=False,
+        )[0]
+
+        if guidance_scale > 1.0:
+            noise_u, noise_t = noise_pred.chunk(2)
+            return noise_u + guidance_scale * (noise_t - noise_u)
+        return noise_pred
+
+    def dvdx_jvp(self, x, direction, timestep, prompt_embeds, pooled_embeds, guidance_scale):
+        def velocity_fn(x_in):
+            return self.target_velocity(
+                x_in, timestep, prompt_embeds, pooled_embeds, guidance_scale
+            )
+
+        with sdpa_kernel(SDPBackend.MATH), torch.autocast(
+            device_type=x.device.type,
+            dtype=self.dtype,
+            enabled=x.is_cuda,
+        ):
+            _, jvp_out = jvp(velocity_fn, (x,), (direction,))
+        return jvp_out / (direction + 1e-6)
+
     @torch.no_grad()
     def run_ekf_edit_rf(self, 
                     source_image: torch.Tensor,
@@ -84,10 +116,11 @@ class EditPipeline:
                     lambda_1: float = 0.1,
                     lambda_2: float = 1.0,
                     inject_steps: int = 20,
-                    save_vis_path: str = "vis_output.png"):
+                    save_vis_path: str = "vis_output.png",
+                    dvdx_method: str = "fd"):
 
         self.clear_memory()
-        print(f"Starting EKF-Edit: Steps={T_steps}, eta={eta}, Skip={T_start}")
+        print(f"Starting EKF-Edit: Steps={T_steps}, eta={eta}, Skip={T_start}, dvdx={dvdx_method}")
 
         latents_src = self.encode_image(source_image)
         
@@ -270,6 +303,11 @@ class EditPipeline:
 
             # 求Jacobian
             def dvdx_func(x, v_curr, t_curr, _t_prev):
+                if dvdx_method == "jvp":
+                    return self.dvdx_jvp(
+                        x, v_curr, t_curr, tar_emb, tar_pool, tar_guidance_scale
+                    )
+
                 epsilon = 1e-2
                 dx = v_curr * epsilon
                 x = x + dx
@@ -361,10 +399,11 @@ class EditPipeline:
                     tar_guidance_scale: float = 5.5, 
                     lambda_1: float = 0.1,
                     lambda_2: float = 1.0,
-                    save_vis_path: str = "vis_output.png"):
+                    save_vis_path: str = "vis_output.png",
+                    dvdx_method: str = "fd"):
 
         self.clear_memory()
-        print(f"Starting EKF-DNA-Edit: Steps={T_steps}, eta={eta}, Skip={T_start}")
+        print(f"Starting EKF-DNA-Edit: Steps={T_steps}, eta={eta}, Skip={T_start}, dvdx={dvdx_method}")
 
         latents_src = self.encode_image(source_image)
         
@@ -392,19 +431,19 @@ class EditPipeline:
         
         delta_z_dict = {} 
         v_inv_dict = {}   
-        inv_sigmas = torch.cat([sigmas, torch.tensor([0], device=self.device)]).flip(0)
+        inv_sigmas = sigmas.flip(0)
         for i, (t_curr, t_next) in enumerate(zip(tqdm(inv_sigmas[:-1], desc="Inverting"), inv_sigmas[1:])):
             if len(inv_sigmas) - 1 - i == skip_steps:
                 break
 
-            t_key_val = int(t_next.item())
+            t_key_val = int(t_next.item() * 1000)
             
             zt_curr_inv = zt_inv 
             
             # Bridge 公式
             zt_next_inv = (t_next - t_curr) / (1 - t_curr) * (noise_inv - zt_inv) + zt_inv
             
-            t_expand = t_next.expand(zt_next_inv.shape[0])
+            t_expand = (t_next * 1000).expand(zt_next_inv.shape[0])
             v_pred_inv = self.pipe.transformer(
                 hidden_states=zt_next_inv,
                 timestep=t_expand,
@@ -524,6 +563,11 @@ class EditPipeline:
             
             # Jacobian
             def dvdx_func(x, v_curr, t_curr, _t_prev):
+                if dvdx_method == "jvp":
+                    return self.dvdx_jvp(
+                        x, v_curr, t_curr, tar_emb, tar_pool, tar_guidance_scale
+                    )
+
                 epsilon = 1e-2
                 dx = v_curr * epsilon
                 x = x + dx
@@ -641,6 +685,10 @@ if __name__ == "__main__":
         '--method', type=str, default='ekf_edit_dna', choices=['ekf_edit_dna', 'ekf_edit_rf'],
         help='Editing method to use, either "ekf_edit_dna" or "ekf_edit_rf"'
     )
+    parser.add_argument(
+        '--dvdx_method', type=str, default='fd', choices=['fd', 'jvp'],
+        help='Method for computing dvdx'
+    )
 
     args = parser.parse_args()
 
@@ -665,6 +713,7 @@ if __name__ == "__main__":
                 lambda_1=args.lambda_1,
                 lambda_2=args.lambda_2,
                 eta=args.eta,
+                dvdx_method=args.dvdx_method,
                 save_vis_path=f"{args.output.split('.')[0]}_vis.png"
             )
         else:
@@ -679,6 +728,7 @@ if __name__ == "__main__":
                 lambda_1=args.lambda_1,
                 lambda_2=args.lambda_2,
                 eta=args.eta,
+                dvdx_method=args.dvdx_method,
                 save_vis_path=f"{args.output.split('.')[0]}_vis.png"
             )
         result.save(args.output)

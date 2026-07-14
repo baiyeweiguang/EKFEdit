@@ -25,7 +25,7 @@ class ExtendedKalmanFilter:
         dvdx = dvdx_func(zt_tar, v_tar, t_curr, t_prev)
         dvdx = dvdx.to(torch.float32) * dt
         dvdx = torch.clamp(dvdx, -10.0, 10.0)
-        F_diag = 1.0 + dt * dvdx
+        F_diag = 1.0 + dvdx
         
         # P_pred = F * P * F^T + Q
         self.P = (F_diag ** 2) * self.P + self.Q
